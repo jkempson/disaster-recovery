@@ -6,6 +6,12 @@
 **Recovery Time Estimate:** 4-8 hours active work, 24-48 hours total (includes hardware delivery)
 **Data Loss Estimate:** Maximum 24 hours (from last backup)
 
+📝 **NOTE:** This guide exists in TWO locations:
+- **Local:** `/mnt/pve/cephfs/docs/06-operations/disaster-recovery/complete-loss-recovery.md`
+- **GitHub:** https://github.com/jkempson/disaster-recovery/blob/main/COMPLETE-LOSS-RECOVERY.md
+
+**If you update one, update the other to keep them in sync!**
+
 ---
 
 ## Important Notes
@@ -91,14 +97,29 @@ Complete: Homelab operational (24-48 hours total)
 
 ### Step 1.1: Acquire Hardware
 
-**Minimum Requirements:**
-- CPU: Intel i5/i7 or AMD Ryzen equivalent (4+ cores)
-- RAM: 32GB minimum
-- Storage: 500GB NVMe SSD minimum
-- Network: Gigabit Ethernet
+**Your Original Setup (for reference):**
+- **3 identical nodes** (same device model)
+- **CPU:** Intel Celeron N5105, 4 cores, 2.0GHz
+- **RAM:** node1: 32GB, node2/node3: 15GB
+- **Storage:**
+  - System disk (for Proxmox OS)
+  - 466GB SSD (for Ceph OSD)
+- **Network:** Gigabit Ethernet
 
-**Recommended:**
-- HP EliteDesk 800 G3 or similar business-class mini PC
+**Minimum Requirements for 3-Node Cluster:**
+- **CPU:** 4+ cores (Intel Celeron N5105 or better)
+- **RAM:**
+  - node1: 32GB recommended (hosts more VMs)
+  - node2/node3: 15GB minimum each
+- **Storage (per node):**
+  - 1× System disk: 100GB+ (for Proxmox OS)
+  - 1× Ceph OSD disk: 466GB+ SSD (for distributed storage)
+- **Network:** Gigabit Ethernet minimum
+
+**Hardware Options:**
+- **Exact match:** Same device models as original setup
+- **Alternative:** Business-class mini PC with similar specs
+- **Budget:** Used enterprise small form factor PCs
 
 ### Step 1.2: Install Proxmox VE
 
