@@ -104,7 +104,9 @@ Complete: Homelab operational (24-48 hours total)
 - **Storage:**
   - System disk (for Proxmox OS)
   - 466GB SSD (for Ceph OSD)
-- **Network:** Gigabit Ethernet
+- **Network:**
+  - **3× Gigabit Ethernet NICs** (enp2s0, enp4s0, enp5s0)
+  - **4th NIC available** (enp3s0) but unused
 
 **Minimum Requirements for 3-Node Cluster:**
 - **CPU:** 4+ cores (Intel Celeron N5105 or better)
@@ -114,7 +116,12 @@ Complete: Homelab operational (24-48 hours total)
 - **Storage (per node):**
   - 1× System disk: 100GB+ (for Proxmox OS)
   - 1× Ceph OSD disk: 466GB+ SSD (for distributed storage)
-- **Network:** Gigabit Ethernet minimum
+- **Network:**
+  - **3× Gigabit Ethernet NICs minimum** (MTU 9000 support required)
+  - **NIC 1 (vmbr0):** Proxmox management + Ceph cluster traffic (MTU 9000)
+  - **NIC 2 (vmbr2):** Internal isolated network (MTU 9000)
+  - **NIC 3 (vmbr1):** VM-only network (no MTU requirement)
+  - All NICs must support MTU 9000 for Ceph performance optimization
 
 **Hardware Options:**
 - **Exact match:** Same device models as original setup
@@ -139,23 +146,39 @@ Complete: Homelab operational (24-48 hours total)
    ```
 
 3. **Boot from USB and install:**
-   - Follow Proxmox installer
-   - Network configuration:
-     - Hostname: `node1.yourdomain.org`
-     - IP: `192.168.0.4` (or your preferred IP)
-     - Gateway: `192.168.0.1`
-     - DNS: `192.168.0.1` or `1.1.1.1`
+   - Follow Proxmox installer prompts
+   - **During installation, configure only the PRIMARY network interface (will create vmbr0)**
+   - Additional network bridges will be configured in Step 1.3.1
+
+   **Primary Network Configuration (vmbr0):**
+   - **Interface:** First NIC (will become vmbr0)
+   - **IP Addresses:**
+     - node1: `192.168.0.4/8` (not /24!)
+     - node2: `192.168.0.9/8`
+     - node3: `192.168.0.6/8`
+   - **Gateway:** `192.168.0.1`
+   - **DNS:** `192.168.0.1` (your router) or `1.1.1.1` (Cloudflare)
+   - **Hostnames:**
+     - node1: `node1.yourdomain.org`
+     - node2: `node2.yourdomain.org`
+     - node3: `node3.yourdomain.org`
 
 4. **Verify network connectivity:**
    ```bash
    ping 8.8.8.8
    ping google.com
+
+   # Verify nodes can reach each other (after all 3 are installed)
+   ping 192.168.0.9  # from node1 to node2
+   ping 192.168.0.6  # from node1 to node3
    ```
 
 5. **Access Proxmox web interface:**
-   - URL: https://192.168.0.4:8006
-   - Login: `root`
-   - Password: [Your root password]
+   - **node1:** https://192.168.0.4:8006
+   - **node2:** https://192.168.0.9:8006
+   - **node3:** https://192.168.0.6:8006
+   - **Login:** `root`
+   - **Password:** [Your root password]
 
 ### Step 1.3: Update Proxmox
 
@@ -167,6 +190,147 @@ ssh root@192.168.0.4
 apt update
 apt upgrade -y
 ```
+
+### Step 1.3.1: Configure Additional Network Bridges
+
+**⚠️ IMPORTANT:** Your setup uses **3 physical NICs per node** for network separation:
+
+**Network Architecture:**
+- **vmbr0 (enp2s0):** Main network - Proxmox management + Ceph cluster traffic
+- **vmbr2 (enp4s0):** Internal isolated network
+- **vmbr1 (enp5s0):** VM-only network (no host IP)
+
+**Configure on ALL nodes (node1, node2, node3):**
+
+```bash
+# Edit network configuration
+nano /etc/network/interfaces
+```
+
+**Add the following configuration:**
+
+```
+# Primary network (already configured during install)
+auto vmbr0
+iface vmbr0 inet static
+	address 192.168.0.4/8  # Change per node: .4, .9, .6
+	gateway 192.168.0.1
+	bridge-ports enp2s0
+	bridge-stp off
+	bridge-fd 0
+	mtu 9000
+
+# Internal isolated network
+auto vmbr2
+iface vmbr2 inet static
+	address 10.10.10.1/24  # Change per node: .1, .2, .3
+	bridge-ports enp4s0
+	bridge-stp off
+	bridge-fd 0
+	mtu 9000
+
+# VM-only network (no host IP)
+auto vmbr1
+iface vmbr1 inet manual
+	bridge-ports enp5s0
+	bridge-stp off
+	bridge-fd 0
+
+# Set MTU on all physical interfaces
+iface enp2s0 inet manual
+	mtu 9000
+
+iface enp3s0 inet manual
+	mtu 9000
+
+iface enp4s0 inet manual
+	mtu 9000
+
+iface enp5s0 inet manual
+```
+
+**Node-specific IP addresses:**
+- **node1:** vmbr0: 192.168.0.4/8, vmbr2: 10.10.10.1/24
+- **node2:** vmbr0: 192.168.0.9/8, vmbr2: 10.10.10.2/24
+- **node3:** vmbr0: 192.168.0.6/8, vmbr2: 10.10.10.3/24
+
+**Apply network configuration:**
+
+```bash
+# Restart networking
+systemctl restart networking
+
+# Or reboot if networking restart doesn't work cleanly
+reboot
+
+# After reboot, verify all bridges
+ip addr show
+ip link show | grep mtu
+
+# Expected: vmbr0 and vmbr2 should show mtu 9000
+```
+
+**Verify on all nodes:**
+
+```bash
+# Check all bridges are up
+ip addr show vmbr0
+ip addr show vmbr1
+ip addr show vmbr2
+
+# Check MTU is 9000 on vmbr0 and vmbr2
+ip link show vmbr0 | grep mtu
+ip link show vmbr2 | grep mtu
+```
+
+### Step 1.3.2: Install Claude Code (Optional but Recommended)
+
+**💡 WHY:** Claude Code can read and execute the rest of this recovery guide, making the process much easier!
+
+```bash
+# Install Claude Code CLI
+curl -fsSL https://raw.githubusercontent.com/anthropics/claude-code/main/install.sh | sh
+
+# Or manual installation:
+# Download from: https://github.com/anthropics/claude-code/releases
+
+# Verify installation
+claude --version
+
+# Set your API key (get from: https://console.anthropic.com/)
+export ANTHROPIC_API_KEY="your-api-key-here"
+
+# Add to shell profile for persistence
+echo 'export ANTHROPIC_API_KEY="your-api-key-here"' >> ~/.bashrc
+source ~/.bashrc
+
+# Test Claude Code
+claude "hello, can you help me with disaster recovery?"
+```
+
+**Using Claude Code for Recovery:**
+
+```bash
+# Clone this disaster recovery repo
+cd /root/recovery
+git clone https://github.com/jkempson/disaster-recovery.git
+
+# Let Claude Code read and help execute the recovery steps
+claude "Read the file disaster-recovery/COMPLETE-LOSS-RECOVERY.md and help me execute Phase 4: Ceph cluster setup"
+
+# Claude Code can now:
+# - Read all the recovery documentation
+# - Execute commands step-by-step
+# - Handle errors and troubleshooting
+# - Verify each step before proceeding
+```
+
+**Benefits of using Claude Code:**
+- ✅ Reads and understands the entire recovery documentation
+- ✅ Executes commands safely with verification
+- ✅ Handles errors and provides troubleshooting
+- ✅ Tracks progress through the recovery steps
+- ✅ Can adapt steps based on your specific situation
 
 ### Step 1.4: Prepare Proxmox Host for Recovery
 
