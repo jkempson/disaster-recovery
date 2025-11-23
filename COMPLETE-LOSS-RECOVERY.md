@@ -297,7 +297,378 @@ terraform init
 # - Terraform has been successfully initialized!
 ```
 
-### Step 4.2: Review Terraform Plan
+### Step 4.2: Create Ceph Cluster (Manual - Required First)
+
+⚠️ **IMPORTANT:** You must create a NEW Ceph cluster before Terraform can deploy Talos nodes that use it.
+
+This section covers setting up a 3-node Ceph cluster based on your original configuration:
+- **3 Proxmox nodes:** node1 (192.168.0.4), node2 (192.168.0.9), node3 (192.168.0.6)
+- **3 monitors**, **3 managers**, **3 MDS**, **3 OSDs** (one per node)
+- **CephFS filesystem** for shared storage
+
+#### Prerequisites for Ceph Setup
+
+**You need 3 Proxmox nodes installed:**
+- All nodes must be in the same network (192.168.0.0/24)
+- All nodes must be able to ping each other
+- Each node needs at least one dedicated disk/partition for Ceph OSD
+
+**If you only have ONE physical server:**
+- Option A: Deploy Ceph single-node (simplified, less redundant)
+- Option B: Skip Ceph initially, use local storage, add later
+- Option C: Order 2 more mini PCs for proper 3-node cluster
+
+#### Option 1: Three-Node Ceph Cluster (Original Setup)
+
+**Step 4.2.1: Install Proxmox on All 3 Nodes**
+
+```bash
+# Repeat Phase 1 steps for each node:
+# - node1: 192.168.0.4 (primary)
+# - node2: 192.168.0.9
+# - node3: 192.168.0.6
+
+# After installing Proxmox on all 3 nodes, create Proxmox cluster from node1:
+ssh root@192.168.0.4
+pvecm create homelab-cluster
+
+# Join node2 to cluster
+ssh root@192.168.0.9
+pvecm add 192.168.0.4
+
+# Join node3 to cluster
+ssh root@192.168.0.6
+pvecm add 192.168.0.4
+
+# Verify cluster status
+pvecm status
+pvecm nodes
+```
+
+**Step 4.2.2: Configure Network (Jumbo Frames)**
+
+```bash
+# On ALL nodes (node1, node2, node3):
+# Edit /etc/network/interfaces to set MTU 9000
+
+cat >> /etc/network/interfaces << 'EOF'
+
+# Jumbo frames for Ceph
+post-up /sbin/ip link set dev vmbr0 mtu 9000
+EOF
+
+# Apply MTU change
+ip link set dev vmbr0 mtu 9000
+
+# Verify
+ip link show vmbr0 | grep mtu
+# Expected: mtu 9000
+```
+
+**Step 4.2.3: Install Ceph Packages on All Nodes**
+
+```bash
+# On ALL nodes (node1, node2, node3):
+apt update
+apt install -y ceph ceph-mds
+```
+
+**Step 4.2.4: Initialize Ceph Cluster (from node1)**
+
+```bash
+# Run on node1 ONLY:
+cd /root/recovery
+
+# Generate unique cluster ID
+CLUSTER_ID=$(uuidgen)
+echo "Cluster ID: $CLUSTER_ID"
+
+# Create ceph.conf
+cat > /etc/ceph/ceph.conf << EOF
+[global]
+fsid = $CLUSTER_ID
+mon initial members = node1, node2, node3
+mon host = 192.168.0.4, 192.168.0.9, 192.168.0.6
+public network = 192.168.0.0/24
+auth cluster required = cephx
+auth service required = cephx
+auth client required = cephx
+osd pool default size = 3
+osd pool default min size = 2
+osd pool default pg num = 32
+osd pool default pgp num = 32
+EOF
+
+# Create monitor keyring
+ceph-authtool --create-keyring /tmp/ceph.mon.keyring --gen-key -n mon. --cap mon 'allow *'
+
+# Create admin keyring
+ceph-authtool --create-keyring /etc/ceph/ceph.client.admin.keyring --gen-key -n client.admin --cap mon 'allow *' --cap osd 'allow *' --cap mds 'allow *' --cap mgr 'allow *'
+
+# Create bootstrap-osd keyring
+ceph-authtool --create-keyring /var/lib/ceph/bootstrap-osd/ceph.keyring --gen-key -n client.bootstrap-osd --cap mon 'profile bootstrap-osd' --cap mgr 'allow r'
+
+# Add client.admin and bootstrap-osd keys to mon keyring
+ceph-authtool /tmp/ceph.mon.keyring --import-keyring /etc/ceph/ceph.client.admin.keyring
+ceph-authtool /tmp/ceph.mon.keyring --import-keyring /var/lib/ceph/bootstrap-osd/ceph.keyring
+
+# Generate monitor map
+monmaptool --create --add node1 192.168.0.4 --add node2 192.168.0.9 --add node3 192.168.0.6 --fsid $CLUSTER_ID /tmp/monmap
+
+# Create monitor data directory
+mkdir -p /var/lib/ceph/mon/ceph-node1
+chown ceph:ceph /var/lib/ceph/mon/ceph-node1
+
+# Populate monitor daemon
+sudo -u ceph ceph-mon --mkfs -i node1 --monmap /tmp/monmap --keyring /tmp/ceph.mon.keyring
+
+# Enable and start monitor
+systemctl enable ceph-mon@node1
+systemctl start ceph-mon@node1
+
+# Check monitor status
+ceph -s
+```
+
+**Step 4.2.5: Add Monitors on node2 and node3**
+
+```bash
+# Copy config and keyrings to node2 and node3
+for node in node2 node3; do
+  ssh root@$node "mkdir -p /etc/ceph /var/lib/ceph/mon /var/lib/ceph/bootstrap-osd"
+  scp /etc/ceph/ceph.conf root@$node:/etc/ceph/
+  scp /etc/ceph/ceph.client.admin.keyring root@$node:/etc/ceph/
+  scp /tmp/ceph.mon.keyring root@$node:/tmp/
+  scp /tmp/monmap root@$node:/tmp/
+  scp /var/lib/ceph/bootstrap-osd/ceph.keyring root@$node:/var/lib/ceph/bootstrap-osd/
+done
+
+# On node2:
+ssh root@192.168.0.9 << 'EOF'
+mkdir -p /var/lib/ceph/mon/ceph-node2
+chown ceph:ceph /var/lib/ceph/mon/ceph-node2
+sudo -u ceph ceph-mon --mkfs -i node2 --monmap /tmp/monmap --keyring /tmp/ceph.mon.keyring
+systemctl enable ceph-mon@node2
+systemctl start ceph-mon@node2
+EOF
+
+# On node3:
+ssh root@192.168.0.6 << 'EOF'
+mkdir -p /var/lib/ceph/mon/ceph-node3
+chown ceph:ceph /var/lib/ceph/mon/ceph-node3
+sudo -u ceph ceph-mon --mkfs -i node3 --monmap /tmp/monmap --keyring /tmp/ceph.mon.keyring
+systemctl enable ceph-mon@node3
+systemctl start ceph-mon@node3
+EOF
+
+# Verify all monitors are up (run on node1)
+ceph -s
+# Expected: mon: 3 daemons, quorum node1,node2,node3
+```
+
+**Step 4.2.6: Deploy Managers**
+
+```bash
+# On node1, node2, node3:
+for node in node1 node2 node3; do
+  ssh root@$node << 'EOF'
+ceph auth get-or-create mgr.$(hostname) mon 'allow profile mgr' osd 'allow *' mds 'allow *' > /var/lib/ceph/mgr/ceph-$(hostname)/keyring
+systemctl enable ceph-mgr@$(hostname)
+systemctl start ceph-mgr@$(hostname)
+EOF
+done
+
+# Verify (run on node1)
+ceph -s
+# Expected: mgr: <active>, standbys: <standby1>, <standby2>
+```
+
+**Step 4.2.7: Create OSDs**
+
+```bash
+# On each node, identify the disk for OSD
+# Find available disks:
+ssh root@192.168.0.4 lsblk
+ssh root@192.168.0.9 lsblk
+ssh root@192.168.0.6 lsblk
+
+# Assuming /dev/sdb on each node (ADJUST TO YOUR DISKS!)
+# ⚠️ WARNING: This will ERASE the disk!
+
+# Create OSD on node1
+ssh root@192.168.0.4 "ceph-volume lvm create --data /dev/sdb"
+
+# Create OSD on node2
+ssh root@192.168.0.9 "ceph-volume lvm create --data /dev/sdb"
+
+# Create OSD on node3
+ssh root@192.168.0.6 "ceph-volume lvm create --data /dev/sdb"
+
+# Verify OSDs (run on node1)
+ceph osd tree
+ceph osd status
+# Expected: 3 osds: 3 up, 3 in
+```
+
+**Step 4.2.8: Create CephFS (Metadata Servers and Filesystem)**
+
+```bash
+# Create MDS directories on all nodes
+for node in node1 node2 node3; do
+  ssh root@$node "mkdir -p /var/lib/ceph/mds/ceph-$node"
+  ssh root@$node "ceph auth get-or-create mds.$node mon 'profile mds' mgr 'profile mds' mds 'allow *' osd 'allow *' > /var/lib/ceph/mds/ceph-$node/keyring"
+  ssh root@$node "chown -R ceph:ceph /var/lib/ceph/mds/ceph-$node"
+  ssh root@$node "systemctl enable ceph-mds@$node"
+  ssh root@$node "systemctl start ceph-mds@$node"
+done
+
+# Create CephFS pools
+ceph osd pool create cephfs_data 32
+ceph osd pool create cephfs_metadata 32
+
+# Create CephFS filesystem
+ceph fs new cephfs cephfs_metadata cephfs_data
+
+# Verify
+ceph fs status
+ceph mds stat
+# Expected: 1 up, 2 standby
+```
+
+**Step 4.2.9: Create Additional Pools**
+
+```bash
+# Create RBD pool for VM disks
+ceph osd pool create ceph_pool_1 32
+
+# Initialize RBD pool
+rbd pool init ceph_pool_1
+
+# Verify pools
+ceph osd pool ls
+ceph df
+```
+
+**Step 4.2.10: Mount CephFS on Proxmox Nodes**
+
+```bash
+# Extract Ceph admin key
+CEPH_KEY=$(grep key /etc/ceph/ceph.client.admin.keyring | awk '{print $3}')
+echo "Ceph admin key: $CEPH_KEY"
+
+# Save key for Terraform
+echo "CEPH_ADMIN_KEY=$CEPH_KEY" >> /root/recovery/.envrc
+
+# Mount CephFS on all nodes
+for node in node1 node2 node3; do
+  ssh root@$node "mkdir -p /mnt/pve/cephfs"
+  ssh root@$node "mount -t ceph 192.168.0.4,192.168.0.9,192.168.0.6:/ /mnt/pve/cephfs -o name=admin,secret=$CEPH_KEY"
+done
+
+# Verify mounts
+df -h /mnt/pve/cephfs
+
+# Add to /etc/fstab on all nodes for persistence
+for node in node1 node2 node3; do
+  ssh root@$node "echo '192.168.0.4,192.168.0.9,192.168.0.6:/     /mnt/pve/cephfs     ceph    name=admin,secret=$CEPH_KEY,noatime,_netdev    0       2' >> /etc/fstab"
+done
+```
+
+**Step 4.2.11: Verify Ceph Cluster Health**
+
+```bash
+# Check cluster status
+ceph -s
+ceph health detail
+
+# Expected output:
+#   cluster:
+#     id:     <uuid>
+#     health: HEALTH_OK
+#
+#   services:
+#     mon: 3 daemons, quorum node1,node2,node3
+#     mgr: <active>(active), standbys: <standby1>, <standby2>
+#     mds: cephfs:1 {0=<active>} 2 up:standby
+#     osd: 3 osds: 3 up, 3 in
+#
+#   data:
+#     pools:   4 pools, 128 pgs
+#     objects: 0 objects, 0 B
+#     usage:   <usage> / <total>
+#     pgs:     128 active+clean
+
+# Test CephFS write
+echo "test" > /mnt/pve/cephfs/recovery-test.txt
+cat /mnt/pve/cephfs/recovery-test.txt
+rm /mnt/pve/cephfs/recovery-test.txt
+```
+
+**Checkpoint:** ✅ Three-node Ceph cluster operational with CephFS mounted
+
+---
+
+#### Option 2: Single-Node Ceph (Simplified, Less Redundant)
+
+If you only have ONE physical server and can't wait for additional hardware:
+
+```bash
+# Install Ceph
+apt install -y ceph ceph-mds
+
+# Deploy with Proxmox GUI
+# 1. In Proxmox web UI, go to Datacenter > Ceph
+# 2. Click "Install Ceph"
+# 3. Follow wizard:
+#    - Select single-node configuration
+#    - Choose disk for OSD
+#    - Create CephFS
+
+# Or use CLI:
+pveceph install
+pveceph init --network 192.168.0.0/24
+pveceph mon create
+pveceph mgr create
+pveceph osd create /dev/sdb  # Adjust disk
+
+# Create pools and CephFS
+ceph osd pool create cephfs_data 32
+ceph osd pool create cephfs_metadata 32
+ceph fs new cephfs cephfs_metadata cephfs_data
+
+# Mount CephFS
+mkdir -p /mnt/pve/cephfs
+CEPH_KEY=$(grep key /etc/ceph/ceph.client.admin.keyring | awk '{print $3}')
+mount -t ceph 192.168.0.4:/ /mnt/pve/cephfs -o name=admin,secret=$CEPH_KEY
+
+# Note: Single-node Ceph has NO redundancy
+# Replication will show HEALTH_WARN because min_size=2 cannot be met
+# Set size=1 for single-node:
+ceph osd pool set cephfs_data size 1 --yes-i-really-mean-it
+ceph osd pool set cephfs_metadata size 1 --yes-i-really-mean-it
+```
+
+**Checkpoint:** ✅ Single-node Ceph operational (no redundancy)
+
+---
+
+#### Option 3: Skip Ceph Initially
+
+If Ceph setup is too complex for immediate recovery:
+
+```bash
+# Edit terraform.tfvars to use local storage instead of Ceph
+# In /root/recovery/terraform.tfvars, find and modify:
+# - Comment out ceph_* variables
+# - Set storage backend to local
+
+# Deploy cluster with local storage
+# Add Ceph later once cluster is stable and you have more time
+```
+
+**Note:** You'll need to migrate data to Ceph later if you choose this option.
+
+### Step 4.3: Review Terraform Plan
 
 ```bash
 # Review what Terraform will create
@@ -317,7 +688,7 @@ terraform plan
 - Resource counts should be reasonable
 - No unexpected deletions
 
-### Step 4.3: Apply Terraform Configuration
+### Step 4.4: Apply Terraform Configuration
 
 ```bash
 # Deploy infrastructure
